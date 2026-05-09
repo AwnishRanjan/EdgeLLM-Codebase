@@ -1,9 +1,7 @@
-from utils import trainer_wrappers
 from utils import bnb_wrappers
 
 import os
 from os.path import join
-from typing import Dict
 import numpy as np
 from tqdm import tqdm
 import logging
@@ -13,33 +11,20 @@ import evaluate
 import torch
 import transformers
 from models.edge_llama_modelling import LlamaForCausalLM
-from models.configuration import LlamaConfig
-from transformers import set_seed, Seq2SeqTrainer, LlamaTokenizer
-from peft import LoraConfig, get_peft_model
+from transformers import set_seed
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from utils.argument_parser import get_args
 from utils.logger import get_logger
-from pruning.pruner import get_pruned_model
 from utils.dataloader import make_data_module, get_wikitext2_dataset, get_ptb_dataset
+from utils.layer_utils import get_base_model
+from utils.model_loader import get_accelerate_model
+from utils.trainer_wrappers import EdgeLLMTrainer
 
 if torch.cuda.is_available():   
     torch.backends.cuda.matmul.allow_tf32 = True
 logger = logging.getLogger(__name__)
 
 IGNORE_INDEX = -100
-DEFAULT_PAD_TOKEN = "[PAD]"
-
-def find_all_linear_names(args, model):
-    cls = torch.nn.Linear
-    lora_module_names = set()
-    for name, module in model.named_modules():
-        if isinstance(module, cls):
-            names = name.split('.')
-            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-
-    if 'lm_head' in lora_module_names: # needed for 16-bit
-        lora_module_names.remove('lm_head')
-    return list(lora_module_names)
 
 class SavePeftModelCallback(transformers.TrainerCallback):
     def save_model(self, args, state, kwargs):
@@ -68,73 +53,6 @@ class SavePeftModelCallback(transformers.TrainerCallback):
         touch(join(args.output_dir, 'completed'))
         self.save_model(args, state, kwargs)
 
-def get_accelerate_model(args, logger):
-
-    layers_qats = {i: {"w": args.uniform_bits, "a": args.uniform_bits, "kv": args.uniform_bits} 
-                for i in range(args.layer_num)}
-    if args.qat:
-        for layer_idx in (2, 29, 30, 31):
-            if layer_idx < args.layer_num:
-                layers_qats[layer_idx] = {"w": args.w_bits, "a": args.a_bits, "kv": args.kv_bits}
-    else:
-        layers_qats = {i: {"w": 32, "a": 32, "kv": 32} for i in range(args.layer_num)}
-
-    logger.info(layers_qats)
-    config = LlamaConfig.from_pretrained(args.model_name_or_path)
-    config.use_cache = False
-    model_kwargs = {
-        "pretrained_model_name_or_path": args.model_name_or_path,
-        "low_cpu_mem_usage": True,
-        "layer_qats": layers_qats,
-        "cache_dir": args.cache_dir,
-        "device_map": "auto",
-    }
-    if args.qat:
-        model_kwargs["torch_dtype"] = torch.bfloat16
-    model = LlamaForCausalLM.from_pretrained(
-            **model_kwargs
-        )
-
-    tokenizer = transformers.LlamaTokenizer.from_pretrained(
-        pretrained_model_name_or_path=args.model_name_or_path,
-        cache_dir = args.cache_dir,
-    )
-
-    if tokenizer._pad_token is None:
-        smart_tokenizer_and_embedding_resize(
-            special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
-            tokenizer=tokenizer,
-            model=model,
-        )
-    if 'llama' in args.model_name_or_path or isinstance(tokenizer, LlamaTokenizer):
-        print('Adding special tokens.')
-        tokenizer.add_special_tokens({
-                "eos_token": tokenizer.convert_ids_to_tokens(model.config.eos_token_id),
-                "bos_token": tokenizer.convert_ids_to_tokens(model.config.bos_token_id),
-                "unk_token": tokenizer.convert_ids_to_tokens(
-                    model.config.pad_token_id if model.config.pad_token_id != -1 else tokenizer.pad_token_id
-                ),
-        })
-
-    if args.pruning:
-        logger.info('*******************BEGIN: Pruning Models*******************')
-        model = get_pruned_model(model, tokenizer, args, logger)
-        logger.info('*******************END: Pruning Models*******************')
-
-    logger.info('*******************Adding LoRA Modules*******************')
-    modules = find_all_linear_names(args, model)
-    config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        target_modules=modules,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, config)
-
-    return model, tokenizer
-
 def print_trainable_parameters(args, model):
     """
     Prints the number of trainable parameters in the model.
@@ -151,29 +69,6 @@ def print_trainable_parameters(args, model):
         f"all params: {all_param} || "
         f"trainable: {100 * trainable_params / all_param}"
     )
-
-def smart_tokenizer_and_embedding_resize(
-    special_tokens_dict: Dict,
-    tokenizer: transformers.PreTrainedTokenizer,
-    model: transformers.PreTrainedModel,
-):
-    """Resize tokenizer and embedding.
-
-    Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
-    """
-    num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
-    model.resize_token_embeddings(len(tokenizer))
-    
-    if num_new_tokens > 0:
-        input_embeddings_data = model.get_input_embeddings().weight.data
-        output_embeddings_data = model.get_output_embeddings().weight.data
-
-        input_embeddings_avg = input_embeddings_data[:-num_new_tokens].mean(dim=0, keepdim=True)
-        output_embeddings_avg = output_embeddings_data[:-num_new_tokens].mean(dim=0, keepdim=True)
-
-        input_embeddings_data[-num_new_tokens:] = input_embeddings_avg
-        output_embeddings_data[-num_new_tokens:] = output_embeddings_avg
-
 def train():
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:26"
     args, training_args = get_args()
@@ -182,14 +77,14 @@ def train():
     logger.info(args)
 
     logger.info("*****************BEGIN:loading model***************")
-    model, tokenizer = get_accelerate_model(args, logger)
+    model, tokenizer = get_accelerate_model(args, logger, LlamaForCausalLM)
     logger.info("*****************END:loading model***************")
 
     logger.info("*****************BEGIN:loading dataset***************")
     data_module = make_data_module(tokenizer=tokenizer, args=args)
     logger.info("*****************END:loading dataset***************")
     
-    trainer = Seq2SeqTrainer(
+    trainer = EdgeLLMTrainer(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
@@ -236,24 +131,25 @@ def train():
                 trainer.model.eval()
                 preds, refs = [], []
                 loss_mmlu = 0
-                preds_layer1, preds_layer2, preds_layer3, preds_layer4 = [], [], [], []
+                exit_layer_indices = trainer.eval_exit_layers
+                preds_by_exit = [[] for _ in exit_layer_indices]
 
                 linear_layers = []
-                while hasattr(model, "model"):
-                    model = model.model
-                exit_layers = [8, 16, 24, 32]
-                model.eval()
+                base_model = get_base_model(model)
+                base_model.eval()
                 
-                for i in exit_layers:
-                    linear_layers.append(getattr(model.layers[i-1], f'linear_layer_{i-1}'))
+                for layer_idx in exit_layer_indices:
+                    linear_layers.append(getattr(base_model.layers[layer_idx], f'linear_layer_{layer_idx}'))
                     
                 with torch.no_grad():
                     for batch in tqdm(data_loader, total=len(data_loader)):
-                        torch.cuda.empty_cache() 
-                        (loss, orig_logits, labels, hidden_states) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False)
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        (loss, orig_logits, labels, hidden_states) = trainer.prediction_step_with_hidden_states(trainer.model,batch,prediction_loss_only=False)
                         exit_layers_logits = list()
-                        for i, idx in enumerate(exit_layers):
-                            exit_layers_logits.append(torch.nn.functional.softmax(linear_layers[i](hidden_states[idx].to(trainer.model.lm_head.weight.dtype).to(linear_layers[i].weight.device)), dim=-1).to('cpu'))
+                        for i, layer_idx in enumerate(exit_layer_indices):
+                            hidden_state_idx = layer_idx + 1
+                            exit_layers_logits.append(torch.nn.functional.softmax(linear_layers[i](hidden_states[hidden_state_idx].to(trainer.model.lm_head.weight.dtype).to(linear_layers[i].weight.device)), dim=-1).to('cpu'))
                         
                         logits = torch.stack(exit_layers_logits, dim=0).to('cpu')
                         topk = torch.topk(logits, k=1, dim=0)[0].squeeze(dim=0)
@@ -265,10 +161,8 @@ def train():
                             logit_abcd = logit[0][label_non_zero_id-1][abcd_idx]
                             exit_layers_preds.append(torch.argmax(logit_abcd).item())
 
-                        preds_layer1.append(exit_layers_preds[0])
-                        preds_layer2.append(exit_layers_preds[1])
-                        preds_layer3.append(exit_layers_preds[2])
-                        preds_layer4.append(exit_layers_preds[3])
+                        for exit_idx, exit_pred in enumerate(exit_layers_preds):
+                            preds_by_exit[exit_idx].append(exit_pred)
 
                         for i, logit in enumerate(final_logits):
                             label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
@@ -281,60 +175,43 @@ def train():
 
                 results = {'mmlu_loss':loss_mmlu/len(data_loader)}
                 subject = mmlu_dataset['subject']
-                subjects = {s:{'refs':[], 'preds_layer1': [], 'preds_layer2': [], 'preds_layer3': [], 'preds_layer4': [],\
-                            'preds_comb': []} for s in set(subject)}
+                subjects = {}
+                for s in set(subject):
+                    subjects[s] = {'refs': [], 'preds_comb': []}
+                    for exit_idx in range(len(exit_layer_indices)):
+                        subjects[s][f'preds_exitlayer{exit_idx + 1}'] = []
 
-                for s, r, pr1, pr2, pr3, pr4, comb_pred in zip(subject, refs, preds_layer1, preds_layer2, preds_layer3, preds_layer4, preds):
-                    subjects[s]['refs'].append(r)
-                    subjects[s]['preds_layer1'].append(pr1)
-                    subjects[s]['preds_layer2'].append(pr2)
-                    subjects[s]['preds_layer3'].append(pr3)
-                    subjects[s]['preds_layer4'].append(pr4)
-                    subjects[s]['preds_comb'].append(comb_pred)
+                for item_idx, s in enumerate(subject):
+                    subjects[s]['refs'].append(refs[item_idx])
+                    for exit_idx, exit_preds in enumerate(preds_by_exit):
+                        subjects[s][f'preds_exitlayer{exit_idx + 1}'].append(exit_preds[item_idx])
+                    subjects[s]['preds_comb'].append(preds[item_idx])
 
-                subject_scores_layer1 = []
-                subject_scores_layer2 = []
-                subject_scores_layer3 = []
-                subject_scores_layer4 = []
+                subject_scores_by_exit = [[] for _ in exit_layer_indices]
                 subject_scores_comb = []
 
                 for subject in subjects:
-                    subject_score_layer1 = accuracy.compute(
-                        references=subjects[subject]['refs'],
-                        predictions=subjects[subject]['preds_layer1']
-                    )['accuracy']
-                    subject_score_layer2 = accuracy.compute(
-                        references=subjects[subject]['refs'],
-                        predictions=subjects[subject]['preds_layer2']
-                    )['accuracy']
-                    subject_score_layer3 = accuracy.compute(
-                        references=subjects[subject]['refs'],
-                        predictions=subjects[subject]['preds_layer3']
-                    )['accuracy']
-                    subject_score_layer4 = accuracy.compute(
-                        references=subjects[subject]['refs'],
-                        predictions=subjects[subject]['preds_layer4']
-                    )['accuracy']
+                    for exit_idx in range(len(exit_layer_indices)):
+                        subject_score = accuracy.compute(
+                            references=subjects[subject]['refs'],
+                            predictions=subjects[subject][f'preds_exitlayer{exit_idx + 1}']
+                        )['accuracy']
+                        subject_scores_by_exit[exit_idx].append(subject_score)
                     subject_score_comb = accuracy.compute(
                         references=subjects[subject]['refs'],
                         predictions=subjects[subject]['preds_comb']
                     )['accuracy']
 
-                    subject_scores_layer1.append(subject_score_layer1)
-                    subject_scores_layer2.append(subject_score_layer2)
-                    subject_scores_layer3.append(subject_score_layer3)
-                    subject_scores_layer4.append(subject_score_layer4)
                     subject_scores_comb.append(subject_score_comb)
 
-                results[f'mmlu_{args.mmlu_split}_accuracy_exitlayer1'] = np.mean(subject_scores_layer1)
-                results[f'mmlu_{args.mmlu_split}_accuracy_exitlayer2'] = np.mean(subject_scores_layer2)
-                results[f'mmlu_{args.mmlu_split}_accuracy_exitlayer3'] = np.mean(subject_scores_layer3)
-                results[f'mmlu_{args.mmlu_split}_accuracy_exitlayer4'] = np.mean(subject_scores_layer4)
+                for exit_idx, subject_scores in enumerate(subject_scores_by_exit):
+                    results[f'mmlu_{args.mmlu_split}_accuracy_exitlayer{exit_idx + 1}'] = np.mean(subject_scores)
                 results[f'mmlu_{args.mmlu_split}_accuracy_comb'] = np.mean(subject_scores_comb)
 
-                logger.info(f"{np.mean(subject_scores_layer1)}, {np.mean(subject_scores_layer2)},\
-                    {np.mean(subject_scores_layer3)}, {np.mean(subject_scores_layer4)},\
-                    {np.mean(subject_scores_comb)}")
+                logger.info(", ".join(
+                    [str(np.mean(subject_scores)) for subject_scores in subject_scores_by_exit]
+                    + [str(np.mean(subject_scores_comb))]
+                ))
 
                 trainer.log(results)
                 trainer.data_collator.source_max_len = source_max_len
@@ -346,7 +223,7 @@ def train():
                 wiki_loss_container, ptb_loss_container = [], []
                 with torch.no_grad():
                     for batch in tqdm(wikitext2_dataloader, total=len(wikitext2_dataloader)):
-                        loss, logits, labels, hidden_states = trainer.prediction_step(trainer.model, batch, prediction_loss_only=False,)
+                        loss, logits, labels, hidden_states = trainer.prediction_step_with_hidden_states(trainer.model, batch, prediction_loss_only=False,)
                         logits = logits[0]
 
                         shift_logit = logits[:, :-1, :].contiguous()

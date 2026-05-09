@@ -55,7 +55,8 @@ def llama_sequential(model, dataloader, dev, nsamples, layer_pruning_ratios, log
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()
     model.model.norm = model.model.norm.cpu()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
@@ -120,7 +121,8 @@ def llama_sequential(model, dataloader, dev, nsamples, layer_pruning_ratios, log
         layers[i] = layer.cpu()
         del layer
         del gpts
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         inps, outs = outs, inps
 

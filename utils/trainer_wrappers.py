@@ -1,4 +1,4 @@
-from transformers import Trainer
+from transformers import Trainer, Seq2SeqTrainer
 from transformers import __version__
 
 import contextlib
@@ -114,6 +114,7 @@ from transformers.trainer_callback import (
     TrainerControl,
     TrainerState,
 )
+from utils.layer_utils import get_base_model, get_exit_layer_indices, get_stride_exit_layer_indices
 
 try:
     from transformers.trainer_pt_utils import (
@@ -125,7 +126,6 @@ try:
         distributed_broadcast_scalars,
         distributed_concat,
         find_batch_size,
-        get_dataloader_sampler,
         get_model_param_count,
         get_module_class_from_name,
         get_parameter_names,
@@ -134,8 +134,15 @@ try:
         nested_numpify,
         nested_xla_mesh_reduce,
         reissue_pt_warnings,
-        remove_dummy_checkpoint,
     )
+    try:
+        from transformers.trainer_pt_utils import remove_dummy_checkpoint
+    except ImportError:
+        def remove_dummy_checkpoint(): pass
+    try:
+        from transformers.trainer_pt_utils import get_dataloader_sampler
+    except ImportError:
+        def get_dataloader_sampler(): pass
 except ImportError:
     # Provide fallback implementations or None
     DistributedTensorGatherer = None
@@ -401,9 +408,7 @@ class CustomTrainer(Trainer):
         self._memory_tracker = TrainerMemoryTracker(self.args.skip_memory_metrics)
         self._memory_tracker.start()
         self.total_iterations = self.args.max_steps
-        base = model
-        while hasattr(base, "model"):
-            base = base.model
+        base = get_base_model(model)
         self.base_model = base
         self.num_layers = len(self.base_model.layers)
         self.stride_size = stride_size
@@ -417,21 +422,18 @@ class CustomTrainer(Trainer):
         args._setup_devices
         
         ##############################BEGIN:MODIFICATION##############################
-        exit_layer = []
-        iteration = self.num_layers // self.stride_size
-        temp = 0
-        for i in range(iteration):
-            temp += self.stride_size
-            exit_layer.append(temp-1)
-        iterations_per_layer = self.args.max_steps // len(exit_layer)
-        remainder = self.args.max_steps % len(exit_layer)
+        self.train_exit_layers = get_stride_exit_layer_indices(self.num_layers, self.stride_size, zero_based=True)
+        self.eval_exit_layers = get_exit_layer_indices(self.num_layers, zero_based=True)
+        registered_exit_layers = sorted(set(self.train_exit_layers + self.eval_exit_layers))
+        iterations_per_layer = self.args.max_steps // len(self.train_exit_layers)
+        remainder = self.args.max_steps % len(self.train_exit_layers)
         def save_outputs_hook(model, layer_id:str) -> Callable:
             def fn(_, __, output):
                 setattr(model, f"feature_{layer_id.replace('.','_')}", output)
             return fn
 
          #register hooks
-        for e in exit_layer:
+        for e in registered_exit_layers:
             linear_layer = nn.Linear(base.config.hidden_size, base.config.vocab_size, bias=False)
             linear_layer.weight.data = getattr(model, 'lm_head').weight.data.clone()
             self.base_model.layers[e].register_forward_hook(save_outputs_hook(model, f'{e}'))
@@ -440,9 +442,9 @@ class CustomTrainer(Trainer):
         iteration_queue = deque()
         current_iteration = 0
 
-        for i, layer in enumerate(exit_layer):
+        for i, layer in enumerate(self.train_exit_layers):
             next_iteration = current_iteration + iterations_per_layer
-            if i == len(exit_layer) - 1:
+            if i == len(self.train_exit_layers) - 1:
                 next_iteration += remainder
 
             iteration_queue.append((layer, (current_iteration, next_iteration - 1)))
@@ -1252,7 +1254,11 @@ class CustomTrainer(Trainer):
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
         elif status == "eval":
-            layer_outputs, _ = getattr(model, f"feature_{chosen_layer}")
+            hook_outputs = getattr(model, f"feature_{chosen_layer}")
+            if isinstance(hook_outputs, tuple) and len(hook_outputs) == 2 and isinstance(hook_outputs[0], tuple):
+                layer_outputs, _ = hook_outputs
+            else:
+                layer_outputs = hook_outputs
             input_tensor = layer_outputs[0].to(model.device)
             input_tensor = input_tensor.to(model.lm_head.weight.dtype)
             linear_layer = getattr(self.base_model.layers[chosen_layer], f'linear_layer_{chosen_layer}')
@@ -1308,7 +1314,7 @@ class CustomTrainer(Trainer):
 
         inputs['model_status'] = "eval"
         inputs['adapter_activation'] = adapter_activation_tensor
-        inputs['exit_layers'] = [7, 15, 23, 31]
+        inputs['exit_layers'] = self.eval_exit_layers
         inputs['output_hidden_states'] = True
 
         has_labels = False if len(self.label_names) == 0 else all(inputs.get(k) is not None for k in self.label_names)
@@ -1388,9 +1394,95 @@ class CustomTrainer(Trainer):
 
         return (loss, logits, labels, hidden_states)
     
+class EdgeLLMTrainer(Seq2SeqTrainer):
+    """Explicit trainer for Edge-LLM instead of patching Transformers globally."""
 
-Trainer.__init__ = CustomTrainer.__init__
-Trainer._inner_training_loop = CustomTrainer._inner_training_loop
-Trainer.compute_loss = CustomTrainer.compute_loss
-Trainer.prediction_step = CustomTrainer.prediction_step
+    def __init__(self, *args, stride_size: int = 8, exiting_layer: int = 0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stride_size = stride_size
+        self.exiting_layer = exiting_layer
+        self.base_model = get_base_model(self.model)
+        self.num_layers = len(self.base_model.layers)
+        self.train_exit_layers = get_stride_exit_layer_indices(self.num_layers, self.stride_size, zero_based=True)
+        self.eval_exit_layers = get_exit_layer_indices(self.num_layers, zero_based=True)
+        self.iteration_queue = self._build_iteration_queue()
+        self._register_exit_layer_heads()
 
+    def _build_iteration_queue(self):
+        iterations_per_layer = self.args.max_steps // len(self.train_exit_layers)
+        remainder = self.args.max_steps % len(self.train_exit_layers)
+        iteration_queue = deque()
+        current_iteration = 0
+
+        for i, layer in enumerate(self.train_exit_layers):
+            next_iteration = current_iteration + iterations_per_layer
+            if i == len(self.train_exit_layers) - 1:
+                next_iteration += remainder
+
+            iteration_queue.append((layer, (current_iteration, next_iteration - 1)))
+            current_iteration = next_iteration
+        return iteration_queue
+
+    def _register_exit_layer_heads(self):
+        def save_outputs_hook(model, layer_id: str) -> Callable:
+            def fn(_, __, output):
+                setattr(model, f"feature_{layer_id.replace('.', '_')}", output)
+            return fn
+
+        output_embeddings = self.model.get_output_embeddings()
+        registered_exit_layers = sorted(set(self.train_exit_layers + self.eval_exit_layers))
+        for layer_idx in registered_exit_layers:
+            linear_layer = nn.Linear(self.base_model.config.hidden_size, self.base_model.config.vocab_size, bias=False)
+            linear_layer.weight.data = output_embeddings.weight.data.clone()
+            self.base_model.layers[layer_idx].register_forward_hook(save_outputs_hook(self.model, f"{layer_idx}"))
+            setattr(self.base_model.layers[layer_idx], f"linear_layer_{layer_idx}", linear_layer)
+
+    def _update_active_layer(self, model):
+        current_iteration = self.state.global_step
+        if self.iteration_queue:
+            layer, (start, end) = self.iteration_queue[0]
+            if start <= current_iteration <= end:
+                self.exiting_layer = layer
+            elif len(self.iteration_queue) > 1:
+                self.iteration_queue.popleft()
+                self.exiting_layer = self.iteration_queue[0][0]
+
+        start_index = max(self.exiting_layer + 1 - self.stride_size, 0)
+        end_index = self.exiting_layer + 1
+        for param in model.parameters():
+            param.requires_grad = False
+
+        active_layer_prefixes = tuple(f"layers.{i}." for i in range(start_index, end_index))
+        active_head_names = tuple(f"linear_layer_{i}" for i in range(start_index, end_index))
+        for name, param in model.named_parameters():
+            if not (param.dtype.is_floating_point or param.dtype.is_complex):
+                continue
+            if any(prefix in name for prefix in active_layer_prefixes) or any(head in name for head in active_head_names):
+                param.requires_grad_(True)
+
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        self._update_active_layer(model)
+        return super().training_step(model, inputs)
+
+    compute_loss = CustomTrainer.compute_loss
+
+    def prediction_step_with_hidden_states(
+        self,
+        model: nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[List[str]] = None,
+    ):
+        return CustomTrainer.prediction_step(self, model, inputs, prediction_loss_only, ignore_keys)
+
+    def prediction_step(
+        self,
+        model: nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[List[str]] = None,
+    ):
+        loss, logits, labels, _ = self.prediction_step_with_hidden_states(
+            model, inputs, prediction_loss_only, ignore_keys
+        )
+        return loss, logits, labels

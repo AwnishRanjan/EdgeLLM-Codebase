@@ -1,39 +1,24 @@
 import os
 from os.path import join
-from typing import Dict
 import numpy as np
 from tqdm import tqdm
 import logging
 import torch
 import transformers
 from models.quantized_llama_modelling import LlamaForCausalLM
-from models.configuration import LlamaConfig
-from transformers import set_seed, Seq2SeqTrainer, LlamaTokenizer
-from peft import LoraConfig, get_peft_model
+from transformers import set_seed
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from utils.argument_parser import get_args
 from utils.logger import get_logger
-from pruning.pruner import get_pruned_model
 from utils.dataloader import make_data_module, get_wikitext2_dataset, get_ptb_dataset
+from utils.model_loader import get_accelerate_model
+from utils.trainer_wrappers import EdgeLLMTrainer
 
 if torch.cuda.is_available():   
     torch.backends.cuda.matmul.allow_tf32 = True
 logger = logging.getLogger(__name__)
 
 IGNORE_INDEX = -100
-DEFAULT_PAD_TOKEN = "[PAD]"
-
-def find_all_linear_names(args, model):
-    cls = torch.nn.Linear
-    lora_module_names = set()
-    for name, module in model.named_modules():
-        if isinstance(module, cls):
-            names = name.split('.')
-            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
-
-    if 'lm_head' in lora_module_names: # needed for 16-bit
-        lora_module_names.remove('lm_head')
-    return list(lora_module_names)
 
 class SavePeftModelCallback(transformers.TrainerCallback):
     def save_model(self, args, state, kwargs):
@@ -62,73 +47,6 @@ class SavePeftModelCallback(transformers.TrainerCallback):
         touch(join(args.output_dir, 'completed'))
         self.save_model(args, state, kwargs)
 
-def get_accelerate_model(args, logger):
-
-    layers_qats = {i: {"w": args.uniform_bits, "a": args.uniform_bits, "kv": args.uniform_bits} 
-                for i in range(args.layer_num)}
-    if args.qat:
-        for layer_idx in (2, 29, 30, 31):
-            if layer_idx < args.layer_num:
-                layers_qats[layer_idx] = {"w": args.w_bits, "a": args.a_bits, "kv": args.kv_bits}
-    else:
-        layers_qats = {i: {"w": 32, "a": 32, "kv": 32} for i in range(args.layer_num)}
-
-    logger.info(layers_qats)
-    config = LlamaConfig.from_pretrained(args.model_name_or_path)
-    config.use_cache = False
-    model_kwargs = {
-        "pretrained_model_name_or_path": args.model_name_or_path,
-        "low_cpu_mem_usage": True,
-        "layer_qats": layers_qats,
-        "cache_dir": args.cache_dir,
-        "device_map": "auto",
-    }
-    if args.qat:
-        model_kwargs["torch_dtype"] = torch.bfloat16
-    model = LlamaForCausalLM.from_pretrained(
-            **model_kwargs
-        )
-
-    tokenizer = transformers.LlamaTokenizer.from_pretrained(
-        pretrained_model_name_or_path=args.model_name_or_path,
-        cache_dir = args.cache_dir,
-    )
-
-    if tokenizer._pad_token is None:
-        smart_tokenizer_and_embedding_resize(
-            special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
-            tokenizer=tokenizer,
-            model=model,
-        )
-    if 'llama' in args.model_name_or_path or isinstance(tokenizer, LlamaTokenizer):
-        print('Adding special tokens.')
-        tokenizer.add_special_tokens({
-                "eos_token": tokenizer.convert_ids_to_tokens(model.config.eos_token_id),
-                "bos_token": tokenizer.convert_ids_to_tokens(model.config.bos_token_id),
-                "unk_token": tokenizer.convert_ids_to_tokens(
-                    model.config.pad_token_id if model.config.pad_token_id != -1 else tokenizer.pad_token_id
-                ),
-        })
-
-    if args.pruning:
-        logger.info('*******************BEGIN: Pruning Models*******************')
-        model = get_pruned_model(model, tokenizer, args, logger)
-        logger.info('*******************END: Pruning Models*******************')
-
-    logger.info('*******************Adding LoRA Modules*******************')
-    modules = find_all_linear_names(args, model)
-    config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        target_modules=modules,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, config)
-
-    return model, tokenizer
-
 def print_trainable_parameters(args, model):
     """
     Prints the number of trainable parameters in the model.
@@ -145,29 +63,6 @@ def print_trainable_parameters(args, model):
         f"all params: {all_param} || "
         f"trainable: {100 * trainable_params / all_param}"
     )
-
-def smart_tokenizer_and_embedding_resize(
-    special_tokens_dict: Dict,
-    tokenizer: transformers.PreTrainedTokenizer,
-    model: transformers.PreTrainedModel,
-):
-    """Resize tokenizer and embedding.
-
-    Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
-    """
-    num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
-    model.resize_token_embeddings(len(tokenizer))
-    
-    if num_new_tokens > 0:
-        input_embeddings_data = model.get_input_embeddings().weight.data
-        output_embeddings_data = model.get_output_embeddings().weight.data
-
-        input_embeddings_avg = input_embeddings_data[:-num_new_tokens].mean(dim=0, keepdim=True)
-        output_embeddings_avg = output_embeddings_data[:-num_new_tokens].mean(dim=0, keepdim=True)
-
-        input_embeddings_data[-num_new_tokens:] = input_embeddings_avg
-        output_embeddings_data[-num_new_tokens:] = output_embeddings_avg
-
 def train():
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:26"
     args, training_args = get_args()
@@ -176,14 +71,14 @@ def train():
     logger.info(args)
 
     logger.info("*****************BEGIN:loading model***************")
-    model, tokenizer = get_accelerate_model(args, logger)
+    model, tokenizer = get_accelerate_model(args, logger, LlamaForCausalLM)
     logger.info("*****************END:loading model***************")
 
     logger.info("*****************BEGIN:loading dataset***************")
     data_module = make_data_module(tokenizer=tokenizer, args=args)
     logger.info("*****************END:loading dataset***************")
     
-    trainer = Seq2SeqTrainer(
+    trainer = EdgeLLMTrainer(
         model=model,
         tokenizer=tokenizer,
         args=training_args,

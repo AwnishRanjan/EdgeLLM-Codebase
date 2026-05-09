@@ -1178,12 +1178,13 @@ class LlamaModel(LlamaPreTrainedModel):
             if "adapter_activation" in kwargs:
                 #adapter_activation
                 if model_status == "train":
-                    if(len(kwargs["adapter_activation"]) == len(self.layers)) and not(torch.equal(self.adapter_activation.cuda(), kwargs["adapter_activation"].cuda())):
-                        self.adapter_activation = kwargs["adapter_activation"]
-                        print("Received adapter_activation in LlamaModel: " + str(kwargs["adapter_activation"]))
+                    adapter_activation = kwargs["adapter_activation"].to(self.adapter_activation.device)
+                    if len(adapter_activation) == len(self.layers) and not torch.equal(self.adapter_activation, adapter_activation):
+                        self.adapter_activation = adapter_activation
+                        print("Received adapter_activation in LlamaModel: " + str(adapter_activation))
                 elif model_status == "eval":
                     if len(kwargs["adapter_activation"]) == len(self.layers):
-                        self.adapter_activation = kwargs["adapter_activation"]
+                        self.adapter_activation = kwargs["adapter_activation"].to(self.adapter_activation.device)
                 kwargs.update(adapter_activation=self.adapter_activation[idx].unsqueeze(0))
             if model_status == "train":
                 # kwargs.pop('exit_layers', None)
